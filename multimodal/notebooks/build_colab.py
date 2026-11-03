@@ -70,8 +70,8 @@ The base model (`microsoft/bitnet-b1.58-2B-4T-bf16`, public, MIT, no token neede
 W1.58A8 forward (ternary absmean weights, per-token int8 activations, as in bitnet.cpp); LoRA adapters (full
 precision) are added on q/k/v/o/gate/up/down, and the compressor is full precision.
 
-**Runtime.** L4 or A100 with `bf16` is recommended. A T4 (16 GB) works with `fp16` (the QUICK preset is sized for
-it: frozen base in fp16 ≈ 5 GB, gradient checkpointing, small micro-batch + accumulation) but is ~3–4× slower.
+**Runtime.** L4 or A100 with `bf16` is recommended. A T4 (16 GB) works with emulated `bf16` (measured: 6.1 GB peak, ~1.2–1.5 examples/s;
+`fp16` overflows and gives NaN loss with 2B-4T) but is several times slower.
 Runtimes below are *estimates* (not measured on Colab): QUICK ≈ 1 h on L4 for the four modes, FULL ≈ 5–7 h on L4
 (≈ 3 h on A100).
 """
@@ -132,8 +132,9 @@ from bitnet_vl.latent.train_latent import run
 LOCAL_CHECK = bool(os.environ.get("LATENT_NB_LOCAL_CHECK"))  # set only by build_colab.py --check (CPU smoke run)
 HAS_CUDA = torch.cuda.is_available()
 if HAS_CUDA:
-    major, _ = torch.cuda.get_device_capability()
-    DTYPE = "bf16" if major >= 8 else "fp16"   # Ampere+ (A100/L4): bf16; T4/V100: fp16 + GradScaler
+    # bf16 everywhere torch supports it (native on L4/A100, emulated on T4). 2B-4T overflows fp16: on a T4 the
+    # fp16 smoke run gave NaN loss from step 1, bf16 trained normally (6.1 GB peak, ~1.2-1.5 ex/s).
+    DTYPE = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
 else:
     DTYPE = "fp32"
 print("device:", torch.cuda.get_device_name() if HAS_CUDA else "cpu", "| dtype:", DTYPE)
@@ -165,7 +166,7 @@ print("final acc:", tiny["final_acc"])
 
 PRESETS = """
 MODEL = "microsoft/bitnet-b1.58-2B-4T-bf16"
-PRESET = "QUICK"   # "QUICK" (~1 h on L4, fits a 16 GB T4 in fp16) or "FULL" (~5-7 h on L4); estimates
+PRESET = "QUICK"   # "QUICK" (~1 h on L4, fits a 16 GB T4 in bf16) or "FULL" (~5-7 h on L4); estimates
 MODES = ["none", "cot", "pause", "latent"]
 
 PRESETS = {
