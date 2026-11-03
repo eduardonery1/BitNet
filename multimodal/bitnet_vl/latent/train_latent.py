@@ -11,6 +11,10 @@
 
 Importable: ``run(config: dict) -> results dict`` (keys as the CLI flags with dashes -> underscores). Writes
 ``<out>/results.json`` (accuracy per (eval R, hops), loss curve, periodic evals, config, throughput).
+
+``--ckpt-every N`` writes ``<ckpt-dir or out>/ckpt.pt`` every N steps (trainable weights, optimizer, grad scaler,
+data and RNG state, loss curve); rerunning the same command resumes from it, giving the same trajectory as an
+uninterrupted run. Point ``--ckpt-dir`` at persistent storage (Google Drive on Colab).
 """
 
 from __future__ import annotations
@@ -43,8 +47,12 @@ DEFAULTS = dict(
     eval_R_sweep="0,1,2,4,6,8", n_test=100, eval_batch_size=32, compressor_layers=1, compressor_heads=8,
     max_grad_norm=1.0, seed=0, out=None, device=None, log_every=25, save_weights=False,
     tiny_hidden=256, tiny_layers=4, tiny_intermediate=1024, tiny_heads=4, tiny_kv_heads=2, threads=0,
-    max_minutes=0.0,
+    max_minutes=0.0, ckpt_every=0, ckpt_dir=None, resume=True,
 )
+
+# config keys that may differ between a checkpoint and the run resuming it
+_RESUME_FREE_KEYS = {"out", "ckpt_dir", "ckpt_every", "resume", "max_minutes", "device", "threads", "log_every",
+                     "eval_every", "eval_quick_n", "eval_batch_size", "save_weights", "read_layer"}
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -191,6 +199,56 @@ def eval_R_values(cfg) -> list[int]:
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# checkpointing
+# ----------------------------------------------------------------------------------------------------------------
+def _ckpt_path(cfg) -> Path | None:
+    d = cfg["ckpt_dir"] or cfg["out"]
+    return Path(d) / "ckpt.pt" if d else None
+
+
+def _config_signature(cfg) -> dict:
+    return {k: v for k, v in cfg.items() if k not in _RESUME_FREE_KEYS}
+
+
+def save_checkpoint(path: Path, cfg, reasoner, opt, scaler, sampler, step_done: int, state: dict):
+    """Atomically write everything needed to continue training after `step_done` optimizer steps."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ck = dict(
+        version=1, step=step_done, config=_config_signature(cfg),
+        trainable={n: p.detach().cpu().clone() for n, p in reasoner.named_parameters() if p.requires_grad},
+        opt=opt.state_dict(), scaler=scaler.state_dict(), sampler_rng=sampler.rng.getstate(),
+        py_rng=random.getstate(), torch_rng=torch.get_rng_state(),
+        cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, **state,
+    )
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(ck, str(tmp))
+    os.replace(tmp, path)
+
+
+def load_checkpoint(path: Path, cfg, reasoner, opt, scaler, sampler) -> dict:
+    ck = torch.load(str(path), map_location="cpu", weights_only=False)
+    want, have = _config_signature(cfg), ck["config"]
+    diff = {k: (have.get(k), want.get(k)) for k in set(want) | set(have) if have.get(k) != want.get(k)}
+    if diff:
+        raise ValueError(f"checkpoint {path} was made with a different config (ckpt, now): {diff}")
+    params = dict(reasoner.named_parameters())
+    missing = [n for n, p in params.items() if p.requires_grad and n not in ck["trainable"]]
+    if missing:
+        raise RuntimeError(f"checkpoint {path} lacks trainable params {missing[:5]}")
+    with torch.no_grad():
+        for n, v in ck["trainable"].items():
+            params[n].copy_(v.to(params[n].device, params[n].dtype))
+    opt.load_state_dict(ck["opt"])
+    scaler.load_state_dict(ck["scaler"])
+    sampler.rng.setstate(ck["sampler_rng"])
+    random.setstate(ck["py_rng"])
+    torch.set_rng_state(ck["torch_rng"])
+    if ck["cuda_rng"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(ck["cuda_rng"])
+    return ck
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # training
 # ----------------------------------------------------------------------------------------------------------------
 def run(config: dict) -> dict:
@@ -233,13 +291,35 @@ def run(config: dict) -> dict:
         return min(step // cfg["steps_per_stage"], n_st - 1) if curriculum else None
 
     loss_curve, evals = [], []
-    reasoner.train()
-    t_train = time.time()
     n_examples = n_positions = 0
     run_loss, run_n = 0.0, 0
-    step = 0
+    prior_train_s = 0.0
+    start = 0
+    ckpt = _ckpt_path(cfg)
+    if cfg["resume"] and ckpt is not None and ckpt.exists():
+        ck = load_checkpoint(ckpt, cfg, reasoner, opt, scaler, sampler)
+        start = ck["step"]
+        loss_curve, evals = ck["loss_curve"], ck["evals"]
+        n_examples, n_positions = ck["n_examples"], ck["n_positions"]
+        run_loss, run_n, prior_train_s = ck["run_loss"], ck["run_n"], ck["train_seconds"]
+        print(f"[latent] resumed from {ckpt} at step {start}/{cfg['steps']}", flush=True)
+        del ck
+
+    def checkpoint(step_done):
+        if ckpt is None:
+            return
+        t = time.time()
+        save_checkpoint(ckpt, cfg, reasoner, opt, scaler, sampler, step_done, dict(
+            loss_curve=loss_curve, evals=evals, n_examples=n_examples, n_positions=n_positions,
+            run_loss=run_loss, run_n=run_n, train_seconds=prior_train_s + time.time() - t_train))
+        print(f"[latent] checkpoint step {step_done} -> {ckpt} ({time.time() - t:.1f}s)", flush=True)
+
+    reasoner.train()
+    t_train = time.time()
+    n_examples_start = n_examples
+    steps_done = start
     stopped_early = False
-    for step in range(cfg["steps"]):
+    for step in range(start, cfg["steps"]):
         stage = stage_at(step)
         f = lr_factor(step, cfg["steps"], cfg["warmup_steps"])
         for g in opt.param_groups:
@@ -267,19 +347,23 @@ def run(config: dict) -> dict:
             loss_curve.append(dict(step=step + 1, loss=avg, stage=stage, grad_norm=float(gn)))
             el = time.time() - t_train
             print(f"[latent] step {step + 1}/{cfg['steps']} stage {stage} loss {avg:.4f} gn {float(gn):.2f} "
-                  f"{n_examples / el:.1f} ex/s", flush=True)
+                  f"{(n_examples - n_examples_start) / el:.1f} ex/s", flush=True)
             run_loss, run_n = 0.0, 0
         if cfg["eval_every"] and (step + 1) % cfg["eval_every"] == 0 and step + 1 < cfg["steps"]:
             acc, smp = evaluate(reasoner, test_set, cfg["R"], stage, cfg["eval_batch_size"], cfg["eval_quick_n"],
                                 autocast)
             evals.append(dict(step=step + 1, stage=stage, R=cfg["R"], acc=acc))
             print(f"[latent] eval step {step + 1} stage {stage}: {acc}  e.g. {smp[next(iter(smp))]!r}", flush=True)
+        steps_done = step + 1
+        if cfg["ckpt_every"] and steps_done % cfg["ckpt_every"] == 0 and steps_done < cfg["steps"]:
+            checkpoint(steps_done)
         if cfg["max_minutes"] and (time.time() - t_train) > 60 * cfg["max_minutes"]:
             print(f"[latent] time budget reached at step {step + 1}", flush=True)
             stopped_early = True
             break
-    train_time = time.time() - t_train
-    steps_done = step + 1
+    train_time = prior_train_s + time.time() - t_train
+    if cfg["ckpt_every"] and steps_done > start:
+        checkpoint(steps_done)  # an interrupted final eval then resumes straight into evaluation
 
     # final evaluation: all-latent setting, eval-R sweep
     t_eval = time.time()
@@ -354,6 +438,9 @@ def parse_args(argv=None) -> dict:
     ap.add_argument("--save-weights", action="store_true", help="save LoRA + compressor (or full LM with --train-base)")
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--max-minutes", type=float, default=0.0, help="stop training after this wall time (0 = off)")
+    ap.add_argument("--ckpt-every", type=int, default=0, help="save a resumable checkpoint every N steps (0 = off)")
+    ap.add_argument("--ckpt-dir", default=None, help="checkpoint directory (default --out); e.g. on Google Drive")
+    ap.add_argument("--no-resume", dest="resume", action="store_false", help="ignore an existing checkpoint")
     ap.add_argument("--tiny-hidden", type=int, default=D["tiny_hidden"])
     ap.add_argument("--tiny-layers", type=int, default=D["tiny_layers"])
     ap.add_argument("--tiny-intermediate", type=int, default=D["tiny_intermediate"])

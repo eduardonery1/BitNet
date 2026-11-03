@@ -326,3 +326,56 @@ def test_one_train_step_per_mode(tmp_path, mode, extra):
     assert (tmp_path / "results.json").exists() and (tmp_path / "trainable.pt").exists()
     if extra.get("curriculum"):
         assert [x["stage"] for x in res["loss_curve"]] == [0, 1, 2]
+
+
+@pytest.mark.parametrize("extra", [{"curriculum": True, "steps_per_stage": 2}, {"lora_rank": 0, "train_base": True}])
+def test_resume_after_interrupt_matches_uninterrupted_run(tmp_path, monkeypatch, extra):
+    cfg = dict(model="tiny", mode="latent", R=2, K=2, hops_train="2-3", hops_test="2,3", distractors=1, steps=6,
+               batch_size=2, n_test=4, eval_R_sweep="0,2", tiny_hidden=64, tiny_layers=2, tiny_intermediate=128,
+               tiny_heads=2, tiny_kv_heads=1, lora_rank=4, warmup_steps=1, log_every=1, ckpt_every=3)
+    cfg.update(extra)
+    ref = train_latent.run(dict(cfg, out=str(tmp_path / "ref")))
+
+    class Interrupted(Exception):
+        pass
+
+    orig = train_latent.save_checkpoint
+
+    def save_then_die(path, c, reasoner, opt, scaler, sampler, step_done, state):
+        orig(path, c, reasoner, opt, scaler, sampler, step_done, state)
+        raise Interrupted
+
+    monkeypatch.setattr(train_latent, "save_checkpoint", save_then_die)
+    with pytest.raises(Interrupted):
+        train_latent.run(dict(cfg, out=str(tmp_path / "res")))
+    monkeypatch.setattr(train_latent, "save_checkpoint", orig)
+    assert torch.load(str(tmp_path / "res" / "ckpt.pt"), weights_only=False)["step"] == 3
+    res = train_latent.run(dict(cfg, out=str(tmp_path / "res")))
+
+    assert [x["step"] for x in res["loss_curve"]] == [1, 2, 3, 4, 5, 6]
+    for a, b in zip(ref["loss_curve"], res["loss_curve"]):
+        assert a["stage"] == b["stage"] and a["loss"] == pytest.approx(b["loss"], rel=1e-5, abs=1e-6)
+    assert res["final_acc"] == ref["final_acc"]
+    sd_ref = {n: p for n, p in ref["_reasoner"].named_parameters() if p.requires_grad}
+    for n, p in res["_reasoner"].named_parameters():
+        if p.requires_grad:
+            torch.testing.assert_close(p, sd_ref[n])
+    assert res["throughput"]["steps"] == 6
+
+    with pytest.raises(ValueError, match="different config"):
+        train_latent.run(dict(cfg, out=str(tmp_path / "res"), lr_lora=1e-2))
+
+
+def test_run_suite_skips_finished_modes(tmp_path, monkeypatch):
+    from bitnet_vl.latent import run_suite as suite
+
+    tiny = dict(model="tiny", R=2, K=2, hops_train="2-3", hops_test="2", distractors=1, steps=2, batch_size=2, n_test=2,
+                eval_R_sweep="0", tiny_hidden=64, tiny_layers=2, tiny_intermediate=128, tiny_heads=2, tiny_kv_heads=1,
+                lora_rank=4, warmup_steps=1, log_every=1, ckpt_every=1)
+    cfg_for = lambda m: dict(tiny, mode=m, out=str(tmp_path / m))  # noqa: E731
+    first = suite.run_suite(["none", "pause"], tmp_path, cfg_for=cfg_for)
+    calls = []
+    monkeypatch.setattr(suite, "run", lambda cfg: calls.append(cfg["mode"]) or {})
+    again = suite.run_suite(["none", "pause"], tmp_path, cfg_for=cfg_for)
+    assert calls == [] and again["pause"]["final_acc"] == first["pause"]["final_acc"]
+    assert (tmp_path / "all.json").exists() and (tmp_path / "pause" / "ckpt.pt").exists()

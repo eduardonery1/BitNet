@@ -39,6 +39,7 @@ SOURCES = [
     "bitnet_vl/latent/lora.py",
     "bitnet_vl/latent/reasoner.py",
     "bitnet_vl/latent/train_latent.py",
+    "bitnet_vl/latent/run_suite.py",
     "bitnet_vl/tests/test_latent.py",
 ]
 
@@ -138,8 +139,12 @@ if HAS_CUDA:
 else:
     DTYPE = "fp32"
 print("device:", torch.cuda.get_device_name() if HAS_CUDA else "cpu", "| dtype:", DTYPE)
-RUN_DIR = "runs"
+# Results and checkpoints go to Google Drive when it is mounted (cell above), so a lost runtime only costs the steps
+# since the last checkpoint: re-run the notebook and finished modes are skipped, the unfinished one resumes.
+DRIVE_ROOT = "/content/drive/MyDrive"
+RUN_DIR = f"{DRIVE_ROOT}/bitnet_latent_reasoning" if os.path.isdir(DRIVE_ROOT) else "runs"
 os.makedirs(RUN_DIR, exist_ok=True)
+print("run dir:", RUN_DIR)
 
 
 def run_and_free(cfg):
@@ -165,47 +170,36 @@ print("final acc:", tiny["final_acc"])
 """
 
 PRESETS = """
-MODEL = "microsoft/bitnet-b1.58-2B-4T-bf16"
-PRESET = "QUICK"   # "QUICK" (~1 h on L4, fits a 16 GB T4 in bf16) or "FULL" (~5-7 h on L4); estimates
-MODES = ["none", "cot", "pause", "latent"]
+import copy
+from bitnet_vl.latent import run_suite as suite
 
-PRESETS = {
-    # R thought steps x K soft tokens; curriculum: R+1 stages of `steps_per_stage` (stage 0 = CoT, last = all latent)
-    "QUICK": dict(R=4, K=4, hops_train="2-4", hops_test="2-6", distractors=1, steps=500, batch_size=4, grad_accum=4,
-                  steps_per_stage=50, n_test=50, eval_every=0, eval_R_sweep="0,1,2,4,6,8"),
-    "FULL": dict(R=6, K=4, hops_train="2-6", hops_test="2-8", distractors=2, steps=2000, batch_size=8, grad_accum=4,
-                 steps_per_stage=150, n_test=200, eval_every=500, eval_R_sweep="0,1,2,4,6,8,10"),
-}
-COMMON_CFG = dict(model=MODEL, dtype=DTYPE, lora_rank=16, lora_alpha=32, lr_lora=2e-4, lr_compressor=1e-3,
-                  warmup_steps=30, grad_checkpointing=True, log_every=25, eval_batch_size=32, seed=0)
+MODEL = suite.MODEL
+PRESET = "QUICK"   # "QUICK" (~1 h on L4; ~1.5-2 h per mode on a free T4) or "FULL" (~5-7 h on L4); estimates
+MODES = ["latent", "pause", "none", "cot"]   # most informative first, in case the runtime is reclaimed
+
+# R thought steps x K soft tokens; curriculum: R+1 stages of `steps_per_stage` (stage 0 = CoT, last = all latent).
+# ckpt_every: resumable checkpoint interval (steps).
+PRESETS = copy.deepcopy(suite.PRESETS)
+COMMON_CFG = dict(suite.COMMON_CFG, dtype=DTYPE)
 
 if LOCAL_CHECK:  # CPU smoke test of this very cell with the tiny model (used by build_colab.py --check)
     MODEL = "tiny"
     COMMON_CFG.update(model="tiny", train_base=True, lora_rank=0, lr_base=1e-3, dtype="fp32",
                       tiny_hidden=64, tiny_layers=2, tiny_intermediate=128, grad_checkpointing=True)
     PRESETS["QUICK"].update(R=2, K=2, hops_train="2-3", hops_test="2-4", steps=6, batch_size=2, grad_accum=1,
-                            steps_per_stage=2, n_test=4, eval_R_sweep="0,1,2,4")
+                            steps_per_stage=2, n_test=4, eval_R_sweep="0,1,2,4", ckpt_every=3)
 
 
 def mode_cfg(mode):
-    cfg = dict(COMMON_CFG, **PRESETS[PRESET], mode=mode, out=f"{RUN_DIR}/{PRESET.lower()}_{mode}")
-    cfg["curriculum"] = mode in ("latent", "pause")
-    return cfg
+    return suite.mode_cfg(mode, f"{RUN_DIR}/{PRESET.lower()}", PRESET, common=COMMON_CFG, presets=PRESETS)
 
 for m in MODES:
     print(m, mode_cfg(m))
 """
 
 MAIN = """
-results = {}
-for mode in MODES:
-    t0 = time.time()
-    print(f"===== {mode} =====")
-    results[mode] = run_and_free(mode_cfg(mode))
-    tp = results[mode]["throughput"]
-    print(f"{mode}: {time.time() - t0:.0f}s, {tp['examples_per_s']:.1f} ex/s, "
-          f"max mem {results[mode]['max_memory_gb']} GB, acc {results[mode]['final_acc']}")
-json.dump({k: v for k, v in results.items()}, open(f"{RUN_DIR}/{PRESET.lower()}_all.json", "w"), indent=1)
+# Resumable: modes with a results.json are loaded instead of re-run; an unfinished mode resumes from its ckpt.pt.
+results = suite.run_suite(MODES, f"{RUN_DIR}/{PRESET.lower()}", cfg_for=mode_cfg)
 """
 
 SWEEP_MD = """
@@ -262,20 +256,17 @@ for mode, res in results.items():
 ax[2].set(xlabel="optimizer step", ylabel="train loss", yscale="log", title="training loss")
 ax[2].legend()
 plt.tight_layout()
-plt.savefig(f"{RUN_DIR}/{PRESET.lower()}_plots.png", dpi=120)
+plt.savefig(f"{RUN_DIR}/{PRESET.lower()}/plots.png", dpi=120)
 plt.show()
 """
 
 DRIVE = """
-# Optional: copy runs/ (results.json per mode + plots) to Google Drive.
-SAVE_TO_DRIVE = False
-if SAVE_TO_DRIVE:
+# Persist results + checkpoints on Google Drive (recommended: free runtimes get reclaimed mid-run). With the colab
+# CLI, run `colab drivemount -s NAME` instead of this cell.
+USE_DRIVE = True
+if USE_DRIVE:
     from google.colab import drive
-    import shutil
     drive.mount("/content/drive")
-    dst = f"/content/drive/MyDrive/bitnet_latent_reasoning/{time.strftime('%Y%m%d-%H%M%S')}"
-    shutil.copytree(RUN_DIR, dst)
-    print("saved to", dst)
 """
 
 
@@ -291,13 +282,13 @@ def build() -> dict:
     cells.append(code(FALLBACK_HEAD.strip("\n") + "\n" + body + FALLBACK_TAIL))
     cells += [
         md("## Unit tests"), code(TESTS),
+        md("## Persist to Google Drive"), code(DRIVE),
         md("## Tiny sanity run"), code(COMMON), code(TINY),
         md("## Main experiment: `microsoft/bitnet-b1.58-2B-4T-bf16`\n"
            "Pick `PRESET`. Each mode reloads the frozen base (from the HF cache after the first download)."),
         code(PRESETS), code(MAIN),
         md(SWEEP_MD), code(SWEEP),
         md("## Plots"), code(PLOTS),
-        md("## Save to Google Drive (optional)"), code(DRIVE),
     ]
     for i, c in enumerate(cells):
         c["id"] = f"cell-{i:02d}"

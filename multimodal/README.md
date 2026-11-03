@@ -122,7 +122,8 @@ compressed layer-*i* content beats the same extra compute without feedback (lear
 | `compressor.py` | `LatentCompressor` (K learned queries + step embedding, pre-LN cross-attention + MLP over all positions seen so far, Linear → RMS rescaled to the input-embedding RMS) and `PauseTokens`, both full precision |
 | `lora.py` | minimal LoRA over `nn.Linear`/`BitLinear` (frozen base, FP LoRA path added to the W1.58A8 output; optional one-time ternarization of frozen weights), save/load of LoRA + compressor only |
 | `reasoner.py` | `LatentReasoner` with modes `none` / `latent` / `pause` / `cot`, left-padded batches with explicit position ids, KV-cache reuse, Coconut curriculum, BPTT truncation, `greedy_answer(prompt, R)` |
-| `train_latent.py` | CLI and `run(config) -> results` (results.json: accuracy per (eval R, hops), loss curve, throughput) |
+| `train_latent.py` | CLI and `run(config) -> results` (results.json: accuracy per (eval R, hops), loss curve, throughput); `--ckpt-every N` writes a resumable `ckpt.pt` (trainable weights, optimizer, scaler, data/RNG state), and rerunning the same command continues the same trajectory |
+| `run_suite.py` | runs the four modes as a resumable suite: finished modes (with `results.json`) are skipped, the unfinished one resumes from its checkpoint |
 
 Layout: `<BOS>program\n` + R×K thought positions + remaining trace lines + `Answer: <n><|eot_id|>`. The loss covers the
 target tokens only, and `Answer:` is in the loss only when explicit trace lines come before it. The curriculum uses
@@ -148,11 +149,14 @@ python -m bitnet_vl.latent.train_latent --model tiny --train-base --lora-rank 0 
 python -m bitnet_vl.latent.train_latent --model microsoft/bitnet-b1.58-2B-4T-bf16 --dtype bf16 --mode latent \
     --curriculum --steps-per-stage 50 --R 4 --K 4 --hops-train 2-4 --hops-test 2-6 --steps 500 \
     --batch-size 4 --grad-accum 4 --grad-checkpointing --eval-R-sweep 0,1,2,4,6,8 --out runs/latent
+# all four modes, QUICK preset, resumable (put --run-dir on persistent storage)
+python -m bitnet_vl.latent.run_suite --run-dir runs/quick --preset QUICK --modes latent,pause,none,cot
 ```
 
 Colab: `python multimodal/notebooks/build_colab.py` writes `multimodal/notebooks/bitnet_latent_reasoning.ipynb`. By
 default it clones `eduardonery1/BitNet` (branch `feature/bitnet-vl`, no submodules). It also has a fallback cell, skipped
 by default, that holds embedded copies of the sources for when the clone is stale (`USE_EMBEDDED_SOURCES = True`).
 The notebook runs the tests, a tiny sanity run, and the four modes on 2B4T with the QUICK or FULL preset, then the
-eval-R sweep and plots. Add `--check --workdir DIR` to execute its code cells locally on CPU with the tiny model,
+eval-R sweep and plots. It mounts Google Drive and keeps results and checkpoints there, so after a reclaimed runtime
+re-running the notebook skips finished modes and resumes the unfinished one. Add `--check --workdir DIR` to execute its code cells locally on CPU with the tiny model,
 using the fallback sources.
