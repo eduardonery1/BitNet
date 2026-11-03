@@ -106,3 +106,53 @@ build/bin/llama-mtmd-cli -m ggml-model-i2_s.gguf --mmproj mmproj-bitnet-vl.gguf 
 ```
 Use `--vision-i2s` only for a checkpoint trained with a ternary encoder (`vision_ternary: true`, stage 3).
 Do not use `llama-quantize` to make I2_S files, because its I2_S packer is broken (see the inference doc).
+
+## Latent reasoning
+
+`multimodal/bitnet_vl/latent/` is a separate experiment that reuses the BitNet QAT pieces above (`BitLinear`, the
+HF BitNet loading with `quantization_config` stripped, the offline Llama-3 tokenizer). It tests Coconut-style latent
+reasoning with a compressor. The LLM runs over the prompt, the hidden states at layer *i* (default round(2L/3)) are
+compressed into K soft tokens, and those tokens are appended as input embeddings with the KV cache reused, so only the
+K new positions are computed. This repeats R times before the answer is decoded. The question is whether feeding back
+compressed layer-*i* content beats the same extra compute without feedback (learned pause tokens).
+
+| File | Contents |
+|---|---|
+| `tasks.py` | synthetic variable-tracking programs (`hops` chain length, interleaved distractors, values in [0, 99], trace lines `b = 5`), deterministic per seed, test seeds disjoint from training |
+| `compressor.py` | `LatentCompressor` (K learned queries + step embedding, pre-LN cross-attention + MLP over all positions seen so far, Linear → RMS rescaled to the input-embedding RMS) and `PauseTokens`, both full precision |
+| `lora.py` | minimal LoRA over `nn.Linear`/`BitLinear` (frozen base, FP LoRA path added to the W1.58A8 output; optional one-time ternarization of frozen weights), save/load of LoRA + compressor only |
+| `reasoner.py` | `LatentReasoner` with modes `none` / `latent` / `pause` / `cot`, left-padded batches with explicit position ids, KV-cache reuse, Coconut curriculum, BPTT truncation, `greedy_answer(prompt, R)` |
+| `train_latent.py` | CLI and `run(config) -> results` (results.json: accuracy per (eval R, hops), loss curve, throughput) |
+
+Layout: `<BOS>program\n` + R×K thought positions + remaining trace lines + `Answer: <n><|eot_id|>`. The loss covers the
+target tokens only, and `Answer:` is in the loss only when explicit trace lines come before it. The curriculum uses
+R+1 stages: stage *s* replaces the first *s* trace lines with *s* thought steps, and the last stage is all latent.
+
+Implementation notes:
+- transformers 5 BitNet derives `position_ids` from `cache_position` unless they are passed, which is wrong for left
+  padding. The reasoner always passes position ids that count the real tokens, plus a 2-D mask over past and new
+  positions.
+- HF gradient checkpointing drops the KV cache, so `--grad-checkpointing` uses its own per-layer checkpointing
+  together with `LatentCache`. Its layers update idempotently (`cache[:start] ++ new`), so recomputation during
+  backward does not duplicate cache entries. Tests check that gradients match the non-checkpointed run.
+- Per-token int8 activation rounding is discontinuous, so the exact cached-vs-full-forward and padded-vs-unbatched
+  tests run with activation quantization off at atol 1e-4. With it on, the tolerance is loose.
+
+```bash
+cd multimodal
+python -m pytest bitnet_vl/tests/test_latent.py -q        # CPU, ~25 s
+# tiny random BitNet, all weights trained (sanity check only)
+python -m bitnet_vl.latent.train_latent --model tiny --train-base --lora-rank 0 --mode latent --R 2 --K 2 \
+    --hops-train 2-3 --hops-test 2-4 --distractors 1 --steps 1200 --batch-size 32 --out runs/tiny_latent
+# 2B4T, frozen base + LoRA + compressor (GPU)
+python -m bitnet_vl.latent.train_latent --model microsoft/bitnet-b1.58-2B-4T-bf16 --dtype bf16 --mode latent \
+    --curriculum --steps-per-stage 50 --R 4 --K 4 --hops-train 2-4 --hops-test 2-6 --steps 500 \
+    --batch-size 4 --grad-accum 4 --grad-checkpointing --eval-R-sweep 0,1,2,4,6,8 --out runs/latent
+```
+
+Colab: `python multimodal/notebooks/build_colab.py` writes `multimodal/notebooks/bitnet_latent_reasoning.ipynb`. By
+default it clones `eduardonery1/BitNet` (branch `feature/bitnet-vl`, no submodules). It also has a fallback cell, skipped
+by default, that holds embedded copies of the sources for when the clone is stale (`USE_EMBEDDED_SOURCES = True`).
+The notebook runs the tests, a tiny sanity run, and the four modes on 2B4T with the QUICK or FULL preset, then the
+eval-R sweep and plots. Add `--check --workdir DIR` to execute its code cells locally on CPU with the tiny model,
+using the fallback sources.
