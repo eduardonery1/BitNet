@@ -158,5 +158,18 @@ default it clones `eduardonery1/BitNet` (branch `feature/bitnet-vl`, no submodul
 by default, that holds embedded copies of the sources for when the clone is stale (`USE_EMBEDDED_SOURCES = True`).
 The notebook runs the tests, a tiny sanity run, and the four modes on 2B4T with the QUICK or FULL preset, then the
 eval-R sweep and plots. It mounts Google Drive and keeps results and checkpoints there, so after a reclaimed runtime
-re-running the notebook skips finished modes and resumes the unfinished one. Add `--check --workdir DIR` to execute its code cells locally on CPU with the tiny model,
+re-running the notebook skips finished modes and resumes the unfinished one.
+
+Without the notebook UI, `multimodal/tools/colab/drive.sh` runs the suite on free Colab GPUs through the
+[google-colab-cli](https://pypi.org/project/google-colab-cli/) `colab` command (logged in). Free runtimes get reclaimed
+(after 40 min to 2 h in our runs), and mounting Drive needs browser consent. So it mirrors each finished
+`results.json` and the newest checkpoint into `runs/colab_sync/`. Checkpoints are about 0.9 GB for `latent` and 0.25 GB
+for `pause`; they are snapshotted on the VM, moved in 64 MB chunks and checked with sha256. When a session is lost
+it opens a new one, uploads that state and relaunches. When no GPU is available it retries every 30 min for up to
+16 h. Settings (session name, preset, modes, sync interval) are environment variables, listed in
+`tools/colab/common.sh`.
+
+```bash
+cd multimodal && tools/colab/drive.sh     # or: tools/colab/resume.sh (one launch/resume), tools/colab/sync.sh (watch)
+``` Add `--check --workdir DIR` to execute its code cells locally on CPU with the tiny model,
 using the fallback sources.
