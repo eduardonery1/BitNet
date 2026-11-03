@@ -1045,6 +1045,10 @@ class BitnetModel(Model):
 
         self.gguf_writer.add_vocab_size(self.hparams["vocab_size"])
 
+        # bitnet-b1.58 defaults to relu^2 (2B-4T, hidden_act="relu2"); flag SiLU checkpoints (e.g. 1bitLLM) explicitly
+        if self.hparams.get("hidden_act", "relu2") == "silu":
+            self.gguf_writer.add_bool(f"{gguf.MODEL_ARCH_NAMES[self.model_arch]}.ffn_act_silu", True)
+
         # rope dimension count (required for correct positional encoding)
         if "head_dim" in self.hparams:
             rope_dim = self.hparams["head_dim"]
